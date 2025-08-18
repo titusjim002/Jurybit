@@ -15,6 +15,9 @@
 (define-constant ERR_INSUFFICIENT_APPEAL_STAKE (err u113))
 (define-constant ERR_APPEAL_NOT_FOUND (err u114))
 (define-constant ERR_APPEAL_STILL_ACTIVE (err u115))
+(define-constant ERR_PERFORMANCE_NOT_FOUND (err u116))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u117))
+(define-constant ERR_INVALID_PERFORMANCE_SCORE (err u118))
 
 (define-constant MIN_STAKE u1000000)
 (define-constant JURY_SIZE u5)
@@ -24,6 +27,11 @@
 (define-constant APPEAL_PERIOD u72)
 (define-constant APPEAL_VOTING_PERIOD u216)
 (define-constant APPEAL_MULTIPLIER u3)
+(define-constant PERFORMANCE_TRACKING_PERIOD u1000)
+(define-constant MAX_REPUTATION_SCORE u1000)
+(define-constant MIN_REPUTATION_SCORE u10)
+(define-constant REPUTATION_BONUS_THRESHOLD u800)
+(define-constant PERFORMANCE_PENALTY_THRESHOLD u300)
 
 (define-data-var next-case-id uint u1)
 (define-data-var next-appeal-id uint u1)
@@ -90,6 +98,38 @@
 
 (define-map case-appeals uint uint)
 
+(define-map juror-performance principal
+  {
+    total-votes: uint,
+    correct-votes: uint,
+    total-response-time: uint,
+    average-response-time: uint,
+    consistency-score: uint,
+    performance-rating: uint,
+    last-updated: uint,
+    streak-count: uint,
+    bonus-multiplier: uint
+  }
+)
+
+(define-map performance-history {juror: principal, period: uint}
+  {
+    votes-cast: uint,
+    accuracy-rate: uint,
+    avg-response-time: uint,
+    period-start: uint,
+    period-end: uint
+  }
+)
+
+(define-map juror-voting-patterns {juror: principal, case-id: uint}
+  {
+    vote-time: uint,
+    response-speed: uint,
+    decision-confidence: uint
+  }
+)
+
 (define-public (register-as-juror (stake-amount uint))
   (let
     (
@@ -104,6 +144,19 @@
         cases-served: u0,
         reputation: u100,
         active: true
+      }
+    )
+    (map-set juror-performance caller
+      {
+        total-votes: u0,
+        correct-votes: u0,
+        total-response-time: u0,
+        average-response-time: u0,
+        consistency-score: u500,
+        performance-rating: u500,
+        last-updated: stacks-block-height,
+        streak-count: u0,
+        bonus-multiplier: u100
       }
     )
     (map-set juror-list (var-get total-jurors) caller)
@@ -210,6 +263,7 @@
       )
       (map-set cases case-id updated-case)
       (try! (update-juror-stats caller))
+      (try! (track-voting-performance caller case-id vote))
       (ok true)
     )
   )
@@ -503,6 +557,203 @@
   )
 )
 
+(define-private (track-voting-performance (juror principal) (case-id uint) (vote (string-ascii 10)))
+  (let
+    (
+      (case-data (unwrap! (map-get? cases case-id) ERR_CASE_NOT_FOUND))
+      (response-time (- stacks-block-height (get created-at case-data)))
+      (current-performance (default-to 
+        {
+          total-votes: u0,
+          correct-votes: u0,
+          total-response-time: u0,
+          average-response-time: u0,
+          consistency-score: u500,
+          performance-rating: u500,
+          last-updated: stacks-block-height,
+          streak-count: u0,
+          bonus-multiplier: u100
+        }
+        (map-get? juror-performance juror)
+      ))
+    )
+    (map-set juror-voting-patterns {juror: juror, case-id: case-id}
+      {
+        vote-time: stacks-block-height,
+        response-speed: response-time,
+        decision-confidence: (if (<= response-time u10) u100 u50)
+      }
+    )
+    (map-set juror-performance juror
+      (merge current-performance {
+        total-votes: (+ (get total-votes current-performance) u1),
+        total-response-time: (+ (get total-response-time current-performance) response-time),
+        average-response-time: (/ (+ (get total-response-time current-performance) response-time) 
+                                 (+ (get total-votes current-performance) u1)),
+        last-updated: stacks-block-height
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-performance-after-case (case-id uint))
+  (let
+    (
+      (case-data (unwrap! (map-get? cases case-id) ERR_CASE_NOT_FOUND))
+      (jury-members (unwrap! (map-get? case-jury case-id) ERR_CASE_NOT_FOUND))
+      (winning-vote (if (> (get votes-for-plaintiff case-data) (get votes-for-defendant case-data))
+        "plaintiff"
+        "defendant"
+      ))
+    )
+    (asserts! (not (is-eq (get status case-data) "active")) ERR_CASE_STILL_ACTIVE)
+    (fold update-individual-performance jury-members (ok {case-id: case-id, winning-vote: winning-vote}))
+  )
+)
+
+(define-private (update-individual-performance 
+  (juror principal) 
+  (context-result (response {case-id: uint, winning-vote: (string-ascii 10)} uint)))
+  (match context-result
+    context
+      (let
+        (
+          (case-id (get case-id context))
+          (winning-vote (get winning-vote context))
+          (juror-vote-data (map-get? jury-votes {case-id: case-id, juror: juror}))
+          (current-performance (unwrap! (map-get? juror-performance juror) ERR_PERFORMANCE_NOT_FOUND))
+        )
+        (match juror-vote-data
+          vote-info
+            (let
+              (
+                (voted-correctly (is-eq (get vote vote-info) winning-vote))
+                (new-correct-votes (if voted-correctly 
+                  (+ (get correct-votes current-performance) u1)
+                  (get correct-votes current-performance)
+                ))
+                (new-accuracy (if (> (get total-votes current-performance) u0)
+                  (/ (* new-correct-votes u1000) (get total-votes current-performance))
+                  u0
+                ))
+                (new-streak (if voted-correctly 
+                  (+ (get streak-count current-performance) u1)
+                  u0
+                ))
+                (new-performance-rating (calculate-performance-rating new-accuracy new-streak (get average-response-time current-performance)))
+                (new-bonus-multiplier (calculate-bonus-multiplier new-performance-rating new-streak))
+              )
+              (map-set juror-performance juror
+                (merge current-performance {
+                  correct-votes: new-correct-votes,
+                  streak-count: new-streak,
+                  performance-rating: new-performance-rating,
+                  bonus-multiplier: new-bonus-multiplier,
+                  last-updated: stacks-block-height
+                })
+              )
+              (try! (update-juror-reputation juror new-performance-rating))
+              (ok context)
+            )
+          (ok context)
+        )
+      )
+    error-val (err error-val)
+  )
+)
+
+(define-private (calculate-performance-rating (accuracy uint) (streak uint) (avg-response uint))
+  (let
+    (
+      (accuracy-weight (* accuracy u6))
+      (streak-bonus (if (> (* streak u50) u200) u200 (* streak u50)))
+      (response-penalty (if (> avg-response u50) (- avg-response u50) u0))
+      (base-score (/ (+ accuracy-weight streak-bonus) u10))
+      (final-score (if (> base-score response-penalty) 
+        (- base-score response-penalty)
+        MIN_REPUTATION_SCORE
+      ))
+    )
+    (if (> final-score MAX_REPUTATION_SCORE) MAX_REPUTATION_SCORE final-score)
+  )
+)
+
+(define-private (calculate-bonus-multiplier (performance-rating uint) (streak uint))
+  (let
+    (
+      (base-multiplier u100)
+      (performance-bonus (if (>= performance-rating REPUTATION_BONUS_THRESHOLD) u25 u0))
+      (streak-bonus (if (> (/ streak u2) u20) u20 (/ streak u2)))
+    )
+    (+ base-multiplier performance-bonus streak-bonus)
+  )
+)
+
+(define-private (update-juror-reputation (juror principal) (performance-rating uint))
+  (let
+    (
+      (juror-data (unwrap! (map-get? jurors juror) ERR_NOT_REGISTERED))
+      (current-reputation (get reputation juror-data))
+      (reputation-adjustment (if (>= performance-rating REPUTATION_BONUS_THRESHOLD)
+        u20
+        (if (<= performance-rating PERFORMANCE_PENALTY_THRESHOLD) (- u15) u5)
+      ))
+      (new-reputation (if (>= reputation-adjustment u0)
+        (if (> (+ current-reputation reputation-adjustment) MAX_REPUTATION_SCORE) 
+          MAX_REPUTATION_SCORE 
+          (+ current-reputation reputation-adjustment)
+        )
+        (if (< (- current-reputation (- u0 reputation-adjustment)) MIN_REPUTATION_SCORE) 
+          MIN_REPUTATION_SCORE 
+          (- current-reputation (- u0 reputation-adjustment))
+        )
+      ))
+    )
+    (map-set jurors juror
+      (merge juror-data {
+        reputation: new-reputation
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (calculate-performance-based-reward (juror principal) (base-reward uint))
+  (let
+    (
+      (performance-data (unwrap! (map-get? juror-performance juror) ERR_PERFORMANCE_NOT_FOUND))
+      (bonus-multiplier (get bonus-multiplier performance-data))
+      (enhanced-reward (/ (* base-reward bonus-multiplier) u100))
+    )
+    (ok enhanced-reward)
+  )
+)
+
+(define-public (record-performance-period (juror principal))
+  (let
+    (
+      (current-block stacks-block-height)
+      (period-number (/ current-block PERFORMANCE_TRACKING_PERIOD))
+      (performance-data (unwrap! (map-get? juror-performance juror) ERR_PERFORMANCE_NOT_FOUND))
+      (accuracy-rate (if (> (get total-votes performance-data) u0)
+        (/ (* (get correct-votes performance-data) u100) (get total-votes performance-data))
+        u0
+      ))
+    )
+    (map-set performance-history {juror: juror, period: period-number}
+      {
+        votes-cast: (get total-votes performance-data),
+        accuracy-rate: accuracy-rate,
+        avg-response-time: (get average-response-time performance-data),
+        period-start: (* period-number PERFORMANCE_TRACKING_PERIOD),
+        period-end: (+ (* period-number PERFORMANCE_TRACKING_PERIOD) PERFORMANCE_TRACKING_PERIOD)
+      }
+    )
+    (ok true)
+  )
+)
+
 (define-read-only (get-case (case-id uint))
   (map-get? cases case-id)
 )
@@ -577,3 +828,63 @@
     false
   )
 )
+
+(define-read-only (get-juror-performance (juror principal))
+  (map-get? juror-performance juror)
+)
+
+(define-read-only (get-juror-voting-pattern (juror principal) (case-id uint))
+  (map-get? juror-voting-patterns {juror: juror, case-id: case-id})
+)
+
+(define-read-only (get-performance-history (juror principal) (period uint))
+  (map-get? performance-history {juror: juror, period: period})
+)
+
+(define-read-only (get-juror-accuracy-rate (juror principal))
+  (match (map-get? juror-performance juror)
+    performance-data
+      (if (> (get total-votes performance-data) u0)
+        (some (/ (* (get correct-votes performance-data) u100) (get total-votes performance-data)))
+        (some u0)
+      )
+    none
+  )
+)
+
+(define-read-only (get-performance-tier (juror principal))
+  (match (map-get? juror-performance juror)
+    performance-data
+      (let
+        (
+          (rating (get performance-rating performance-data))
+        )
+        (if (>= rating REPUTATION_BONUS_THRESHOLD)
+          (some "elite")
+          (if (>= rating u500)
+            (some "good")
+            (if (>= rating PERFORMANCE_PENALTY_THRESHOLD)
+              (some "average")
+              (some "poor")
+            )
+          )
+        )
+      )
+    none
+  )
+)
+
+(define-read-only (is-high-performer (juror principal))
+  (match (map-get? juror-performance juror)
+    performance-data
+      (and 
+        (>= (get performance-rating performance-data) REPUTATION_BONUS_THRESHOLD)
+        (>= (get streak-count performance-data) u5)
+      )
+    false
+  )
+)
+
+
+
+
